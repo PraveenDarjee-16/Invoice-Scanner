@@ -1,0 +1,141 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum SubmissionStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum FileKind {
+  PAGE
+  PDF
+  ZIP
+  MEDIA
+}
+
+/// One row per username + mobile number pair.
+model Client {
+  id          String       @id @default(cuid())
+  username    String
+  usernameKey String
+  phone       String       @db.VarChar(10)
+  email       String?
+  disabled    Boolean      @default(false)
+  firstSeenAt DateTime     @default(now())
+  lastSeenAt  DateTime     @default(now())
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  submissions Submission[]
+
+  @@unique([usernameKey, phone])
+  @@index([phone])
+}
+
+model Admin {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  passwordHash String
+  createdAt    DateTime  @default(now())
+  lastLoginAt  DateTime?
+}
+
+/// One "Upload All" action.
+model Submission {
+  id           String           @id @default(cuid())
+  code         String           @unique
+  clientId     String
+  client       Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  status       SubmissionStatus @default(PROCESSING)
+  invoiceCount Int              @default(0)
+  pageCount    Int              @default(0)
+  zipFileId    String?          @unique
+  zipFile      StoredFile?      @relation("SubmissionZip", fields: [zipFileId], references: [id], onDelete: SetNull)
+  errorMessage String?
+  ipAddress    String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  invoices     Invoice[]
+
+  @@index([clientId, createdAt])
+  @@index([createdAt])
+  @@index([status])
+}
+
+/// One PDF inside a submission.
+model Invoice {
+  id           String        @id @default(cuid())
+  submissionId String
+  submission   Submission    @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  position     Int
+  name         String
+  fileName     String
+  pageCount    Int           @default(0)
+  pdfFileId    String?       @unique
+  pdfFile      StoredFile?   @relation("InvoicePdf", fields: [pdfFileId], references: [id], onDelete: SetNull)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  pages        InvoicePage[]
+
+  @@unique([submissionId, position])
+}
+
+/// One scanned page image.
+model InvoicePage {
+  id        String     @id @default(cuid())
+  invoiceId String
+  invoice   Invoice    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  position  Int
+  fileId    String     @unique
+  file      StoredFile @relation("PageFile", fields: [fileId], references: [id], onDelete: Cascade)
+  width     Int        @default(0)
+  height    Int        @default(0)
+  createdAt DateTime   @default(now())
+
+  @@unique([invoiceId, position])
+}
+
+/// Reference to an object in Vercel Blob (never the bytes themselves).
+model StoredFile {
+  id               String       @id @default(cuid())
+  kind             FileKind
+  pathname         String       @unique
+  url              String
+  filename         String
+  contentType      String
+  size             Int
+  createdAt        DateTime     @default(now())
+  zipForSubmission Submission?  @relation("SubmissionZip")
+  pdfForInvoice    Invoice?     @relation("InvoicePdf")
+  pageEntry        InvoicePage? @relation("PageFile")
+}
+
+/// Generic CMS record: projects, services, announcements, ...
+model ContentItem {
+  id         String   @id @default(cuid())
+  collection String
+  title      String
+  slug       String
+  published  Boolean  @default(true)
+  sortOrder  Int      @default(0)
+  data       Json     @default("{}")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([collection, slug])
+  @@index([collection, sortOrder])
+}
+
+/// Login throttling that survives serverless cold starts.
+model RateLimit {
+  key     String   @id
+  count   Int
+  resetAt DateTime
+}
