@@ -12,47 +12,69 @@ export type FilterName = "scan" | "grey" | "color" | "original";
 
 export const WORK_MAX = 1800; // longest side of the working image
 export const OUTPUT_MAX = 1700; // longest side of the produced page
+export const PREVIEW_MAX = 640; // longest side of the live preview (keeps sliders smooth)
 const OPENCV_URL = "https://docs.opencv.org/4.9.0/opencv.js";
 
 /* ------------------------------ OpenCV loader ------------------------------ */
+/**
+ * OpenCV.js is only used by detectCorners(). Nothing else in the scanner depends on it,
+ * and every failure here resolves to `false` (never throws), so a blocked or slow download
+ * cannot break rotation, filters, manual corners or "Use original photo".
+ */
 let cvPromise: Promise<boolean> | null = null;
 
-export function loadOpenCv(): Promise<boolean> {
-  if (cvPromise) return cvPromise;
-  cvPromise = new Promise<boolean>((resolve) => {
-    const w = window as any;
-    if (w.cv?.Mat) return resolve(true);
+const cvReady = () => Boolean((window as any).cv?.Mat);
 
-    const timer = window.setTimeout(() => resolve(false), 25000);
+export function loadOpenCv(): Promise<boolean> {
+  if (cvReady()) return Promise.resolve(true);
+  if (cvPromise) return cvPromise;
+
+  const attempt = new Promise<boolean>((resolve) => {
+    let settled = false;
     const finish = (okay: boolean) => {
+      if (settled) return;
+      settled = true;
       window.clearTimeout(timer);
       resolve(okay);
     };
+    const timer = window.setTimeout(() => finish(cvReady()), 25000);
 
-    const script = document.createElement("script");
-    script.src = OPENCV_URL;
-    script.async = true;
-    script.onerror = () => finish(false);
-    script.onload = async () => {
-      try {
-        let cvObj = w.cv;
-        if (cvObj && typeof cvObj.then === "function") {
-          cvObj = await cvObj; // newer builds expose cv as a promise
-          w.cv = cvObj;
-        }
-        if (cvObj?.Mat) return finish(true);
-        if (cvObj) {
+    try {
+      const script = document.createElement("script");
+      script.src = OPENCV_URL;
+      script.async = true;
+      script.onerror = () => finish(false);
+      script.onload = () => {
+        try {
+          const w = window as any;
+          if (cvReady()) return finish(true);
+          const cvObj = w.cv;
+          if (!cvObj) return finish(false);
+          // Older builds: runtime initialises asynchronously.
           cvObj.onRuntimeInitialized = () => finish(true);
-          return;
+          // Newer builds: `cv` is a promise-like resolving to the module.
+          if (typeof cvObj.then === "function") {
+            cvObj.then((mod: any) => {
+              if (mod?.Mat) w.cv = mod;
+              finish(cvReady());
+            }, () => finish(false));
+          }
+        } catch {
+          finish(false);
         }
-        finish(false);
-      } catch {
-        finish(false);
-      }
-    };
-    document.head.appendChild(script);
+      };
+      document.head.appendChild(script);
+    } catch {
+      finish(false);
+    }
   });
-  return cvPromise;
+
+  cvPromise = attempt;
+  // A failed attempt must not be cached forever, so "Detect edges" can try again.
+  attempt.then((okay) => {
+    if (!okay && cvPromise === attempt) cvPromise = null;
+  });
+  return attempt;
 }
 
 /* --------------------------------- Geometry -------------------------------- */
@@ -130,12 +152,12 @@ const newCanvas = (w: number, h: number) => {
 };
 
 /** Perspective-corrects the quad out of a canvas into a straight, upright page. */
-export function warpQuad(source: HTMLCanvasElement, quad: Quad): HTMLCanvasElement {
-  let outW = Math.max(200, Math.round(Math.max(dist(quad[0], quad[1]), dist(quad[3], quad[2]))));
-  let outH = Math.max(200, Math.round(Math.max(dist(quad[0], quad[3]), dist(quad[1], quad[2]))));
+export function warpQuad(source: HTMLCanvasElement, quad: Quad, maxSide = OUTPUT_MAX): HTMLCanvasElement {
+  let outW = Math.max(40, Math.round(Math.max(dist(quad[0], quad[1]), dist(quad[3], quad[2]))));
+  let outH = Math.max(40, Math.round(Math.max(dist(quad[0], quad[3]), dist(quad[1], quad[2]))));
   const longest = Math.max(outW, outH);
-  if (longest > OUTPUT_MAX) {
-    const k = OUTPUT_MAX / longest;
+  if (longest > maxSide) {
+    const k = maxSide / longest;
     outW = Math.round(outW * k);
     outH = Math.round(outH * k);
   }
@@ -320,6 +342,7 @@ export function applyFilter(canvas: HTMLCanvasElement, filter: FilterName) {
 export function detectCorners(source: HTMLCanvasElement): Quad | null {
   const cv = (window as any).cv;
   if (!cv?.Mat) return null;
+  // Any OpenCV failure returns null instead of throwing, so the scanner keeps working.
 
   const k = Math.min(1, 700 / Math.max(source.width, source.height));
   const small = newCanvas(Math.round(source.width * k), Math.round(source.height * k));
@@ -369,6 +392,51 @@ export function detectCorners(source: HTMLCanvasElement): Quad | null {
     contours?.delete?.();
   }
   return quad;
+}
+
+/* ----------------------- Live pipeline (no stacking) ----------------------- */
+export type ScanSettings = { filter: FilterName; brightness: number; contrast: number };
+
+export const DEFAULT_ADJUST = { brightness: 0, contrast: 1 } as const;
+
+/**
+ * Draws `base` (an UNFILTERED, perspective-corrected page) onto `target`, then applies the
+ * selected filter, brightness and contrast. `base` is never modified, so switching
+ * Scan -> Greyscale -> Colour -> No filter always starts again from the clean pixels.
+ */
+export function drawFinished(base: HTMLCanvasElement, target: HTMLCanvasElement, settings: ScanSettings) {
+  if (target.width !== base.width) target.width = base.width;
+  if (target.height !== base.height) target.height = base.height;
+  const ctx = target.getContext("2d", { willReadFrequently: true }) as CanvasRenderingContext2D;
+  ctx.clearRect(0, 0, target.width, target.height);
+  ctx.drawImage(base, 0, 0);
+  applyFilter(target, settings.filter);
+  applyAdjust(target, settings.brightness, settings.contrast);
+}
+
+/** Full pipeline for the final page: source -> crop/perspective -> filter -> brightness -> contrast. */
+export function renderPage(source: HTMLCanvasElement, quad: Quad, settings: ScanSettings, maxSide = OUTPUT_MAX): HTMLCanvasElement {
+  const base = warpQuad(source, quad, maxSide);
+  const out = newCanvas(base.width, base.height);
+  drawFinished(base, out, settings);
+  return out;
+}
+
+const cross = (a: Point, b: Point, c: Point) => (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+
+/** True when the four corners form a convex quadrilateral with a sensible size. */
+export function isUsableQuad(quad: Quad, width: number, height: number): boolean {
+  const signs = [0, 1, 2, 3].map((i) => Math.sign(cross(quad[i], quad[(i + 1) % 4], quad[(i + 2) % 4])));
+  if (signs.some((v) => v === 0) || !signs.every((v) => v === signs[0])) return false;
+  let area = 0;
+  for (let i = 0; i < 4; i++) area += quad[i].x * quad[(i + 1) % 4].y - quad[(i + 1) % 4].x * quad[i].y;
+  return Math.abs(area) / 2 > width * height * 0.01;
+}
+
+/** Moves the corners together with the image when it is rotated by 90 degrees. */
+export function rotateQuad(quad: Quad, direction: "cw" | "ccw", oldWidth: number, oldHeight: number): Quad {
+  const moved = quad.map((p) => (direction === "cw" ? { x: oldHeight - p.y, y: p.x } : { x: p.y, y: oldWidth - p.x }));
+  return orderCorners(moved);
 }
 
 /* --------------------------------- Helpers --------------------------------- */
